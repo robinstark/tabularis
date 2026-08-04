@@ -32,6 +32,7 @@ import {
   FileDigit,
   ExternalLink,
   PanelBottomOpen,
+  ArrowLeftRight,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -45,6 +46,9 @@ import {
   getResultValueType,
   buildPkMap,
   serializePkKey,
+  resolveExistingCellDisplay,
+  resolveInsertionCellDisplay,
+  getCellStateClass,
   type MergedRow,
 } from "../../utils/dataGrid";
 import { useSettings } from "../../hooks/useSettings";
@@ -55,7 +59,8 @@ import {
   isJsonContent,
   isStructuredValue,
 } from "../../utils/json";
-import { supportsEmptyString } from "../../utils/text";
+import { tokenizeJsonDisplay } from "../../utils/jsonHighlight";
+import { supportsEmptyString, truncateCellPreview } from "../../utils/text";
 import {
   pickPrimaryForeignKeyByColumn,
   getForeignKeyForPreview,
@@ -84,6 +89,7 @@ import type {
   ForeignKey,
 } from "../../types/editor";
 import { MemoRow, type RowCtx } from "./DataGridRow";
+import { renderDefaultCellContent } from "../../utils/dataGridCell";
 
 interface DataGridProps {
   columns: string[];
@@ -213,6 +219,11 @@ export const DataGrid = React.memo(
       setExpandedCell(null);
     }, [data]);
 
+    useEffect(() => {
+      setTransposedColumnWidths({});
+      setTransposedRowHeights({});
+    }, [columns, data]);
+
     const [internalSelectedRowIndices, setInternalSelectedRowIndices] =
       useState<Set<number>>(new Set());
     const [lastSelectedRowIndex, setLastSelectedRowIndex] = useState<
@@ -222,6 +233,19 @@ export const DataGrid = React.memo(
       rowIndex: number;
       colIndex: number;
     } | null>(null);
+    const [isTransposed, setIsTransposed] = useState(false);
+    const [hoveredRowIndex, setHoveredRowIndex] = useState<number | null>(null);
+    const [transposedColumnWidths, setTransposedColumnWidths] = useState<
+      Record<number, number>
+    >({});
+    const [transposedRowHeights, setTransposedRowHeights] = useState<
+      Record<number, number>
+    >({});
+    const handleTransposedHover = useCallback((rowIndex: number) => {
+      setHoveredRowIndex((previous) =>
+        previous === rowIndex ? previous : rowIndex,
+      );
+    }, []);
     const editInputRef = useRef<HTMLInputElement>(null);
     const focusTriggerRef = useRef(0);
     // Mirror of editingCell so the commit/keydown callbacks can read the latest
@@ -418,6 +442,46 @@ export const DataGrid = React.memo(
       // Sort by displayIndex (insertions are now at the end)
       return rows.sort((a, b) => a.displayIndex - b.displayIndex);
     }, [data, pendingInsertions, columns]);
+
+    const transposedBaseRows = useMemo(
+      () =>
+        mergedRows.map((mergedRow, rowIndex) => {
+          const isInsertion = mergedRow.type === "insertion";
+          const pkVal = !isInsertion && pkIndexMaps.length > 0 && pkColumns
+            ? serializePkKey(buildPkMap(pkColumns, mergedRow.rowData, pkIndexMaps))
+            : null;
+          return {
+            mergedRow,
+            rowIndex,
+            isInsertion,
+            pkVal,
+            isPendingDelete:
+              !isInsertion && pkVal
+                ? pendingDeletions?.[pkVal] !== undefined
+                : false,
+          };
+        }),
+      [mergedRows, pkIndexMaps, pkColumns, pendingDeletions],
+    );
+
+    const transposedRows = useMemo(
+      () =>
+        transposedBaseRows.map((row) => ({
+          ...row,
+          isSelected: selectedRowIndices.has(row.rowIndex),
+        })),
+      [transposedBaseRows, selectedRowIndices],
+    );
+
+    const transposedColumnLayout = useMemo(() => {
+      let start = 0;
+      return transposedRows.map((_, index) => {
+        const size = transposedColumnWidths[index] ?? 160;
+        const item = { index, start, size, end: start + size };
+        start += size;
+        return item;
+      });
+    }, [transposedRows, transposedColumnWidths]);
 
     const handleRowClick = useCallback(
       (index: number, event: React.MouseEvent) => {
@@ -1087,6 +1151,68 @@ export const DataGrid = React.memo(
       overscan: 10,
     });
 
+    const transposedColumnVirtualizer = useVirtualizer({
+      count: transposedRows.length,
+      getScrollElement: () => parentRef.current,
+      estimateSize: (index) => transposedColumnWidths[index] ?? 160,
+      horizontal: true,
+      overscan: 20,
+      initialRect: { width: 1024, height: 0 },
+      rangeExtractor: (range) => {
+        const start = Math.max(0, range.startIndex - 20);
+        const end = Math.min(range.count - 1, range.endIndex + 20);
+        const indexes = Array.from(
+          { length: end - start + 1 },
+          (_, index) => start + index,
+        );
+        const editingRowIndex = editingCell?.rowIndex;
+        if (editingRowIndex !== undefined && !indexes.includes(editingRowIndex)) {
+          indexes.push(editingRowIndex);
+          indexes.sort((a, b) => a - b);
+        }
+        return indexes;
+      },
+    });
+
+    const startTransposedColumnResize = useCallback(
+      (event: React.MouseEvent, index: number, initialWidth: number) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const startX = event.clientX;
+        const onMouseMove = (moveEvent: MouseEvent) => {
+          const width = Math.max(80, initialWidth + moveEvent.clientX - startX);
+          transposedColumnVirtualizer.resizeItem(index, width);
+          setTransposedColumnWidths((current) => ({ ...current, [index]: width }));
+        };
+        const onMouseUp = () => {
+          window.removeEventListener("mousemove", onMouseMove);
+          window.removeEventListener("mouseup", onMouseUp);
+        };
+        window.addEventListener("mousemove", onMouseMove);
+        window.addEventListener("mouseup", onMouseUp);
+      },
+      [transposedColumnVirtualizer],
+    );
+
+    const startTransposedRowResize = useCallback(
+      (event: React.MouseEvent, index: number, initialHeight: number) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const startY = event.clientY;
+        const onMouseMove = (moveEvent: MouseEvent) => {
+          const height = Math.max(28, initialHeight + moveEvent.clientY - startY);
+          setTransposedRowHeights((current) => ({ ...current, [index]: height }));
+        };
+        const onMouseUp = () => {
+          window.removeEventListener("mousemove", onMouseMove);
+          window.removeEventListener("mouseup", onMouseUp);
+        };
+        window.addEventListener("mousemove", onMouseMove);
+        window.addEventListener("mouseup", onMouseUp);
+      },
+      [],
+    );
+
     // Track insertion count to auto-scroll to bottom when new rows are added
     const prevInsertionCountRef = useRef(0);
     useEffect(() => {
@@ -1575,6 +1701,34 @@ export const DataGrid = React.memo(
       virtualItems.length > 0
         ? rowVirtualizer.getTotalSize() - virtualItems[virtualItems.length - 1].end
         : 0;
+    const transposedVirtualItems = transposedColumnVirtualizer.getVirtualItems();
+    const shouldVirtualizeTransposedColumns = transposedRows.length > 50;
+    const transposedTotalWidth = transposedColumnLayout.reduce(
+      (width, item) => width + item.size,
+      0,
+    );
+    const visibleTransposedStart = transposedVirtualItems[0]?.index ?? 0;
+    const visibleTransposedEnd =
+      transposedVirtualItems[transposedVirtualItems.length - 1]?.index ?? 0;
+    const renderedTransposedColumns = shouldVirtualizeTransposedColumns
+      ? transposedColumnLayout.slice(
+          Math.max(0, visibleTransposedStart - 20),
+          Math.min(transposedColumnLayout.length, visibleTransposedEnd + 21),
+        )
+      : transposedColumnLayout;
+    const transposedPaddingLeft =
+      shouldVirtualizeTransposedColumns && renderedTransposedColumns.length > 0
+        ? renderedTransposedColumns[0].start
+        : 0;
+    const transposedPaddingRight =
+      shouldVirtualizeTransposedColumns && renderedTransposedColumns.length > 0
+        ? transposedTotalWidth -
+          renderedTransposedColumns[renderedTransposedColumns.length - 1].end
+        : 0;
+    const transposedLabelColumnWidth = 144;
+    // The virtualizer measures after the transpose toggle has rendered. Keep a
+    // small initial window visible instead of flashing an empty grid.
+    const transposedTableWidth = transposedLabelColumnWidth + transposedTotalWidth;
     const totalColumnCount = tableColumns.length + 1;
 
     return (
@@ -1583,50 +1737,307 @@ export const DataGrid = React.memo(
           ref={parentRef}
           className="h-full overflow-auto border border-default rounded bg-elevated relative"
         >
-          <table className="w-full text-left border-collapse">
-            <thead
-              className={`bg-base z-10 shadow-sm ${stickyColumnHeaders ? "sticky top-0" : ""}`}
-            >
-              {table.getHeaderGroups().map((headerGroup) => (
-                <tr key={headerGroup.id}>
-                  <th
-                    onClick={handleSelectAll}
-                    className="px-2 py-2 text-xs font-semibold text-muted border-b border-r border-default bg-base sticky left-0 z-20 text-center select-none w-[50px] min-w-[50px] cursor-pointer hover:bg-elevated"
-                  >
-                    #
-                  </th>
-                  {headerGroup.headers.map((header) => (
-                    <th
-                      key={header.id}
-                      className="px-4 py-2 text-xs font-semibold text-secondary tracking-wider border-b border-r border-default last:border-r-0 whitespace-nowrap"
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        setHeaderContextMenu({
-                          x: e.clientX,
-                          y: e.clientY,
-                          colName: header.id,
-                        });
-                      }}
-                    >
-                      {flexRender(
-                        header.column.columnDef.header,
-                        header.getContext(),
+           <table
+             className={`text-left border-collapse ${isTransposed ? "table-fixed" : "w-full"}`}
+             style={
+               isTransposed
+                 ? {
+                     width: transposedTableWidth,
+                   }
+                 : undefined
+             }
+             onMouseLeave={isTransposed ? () => setHoveredRowIndex(null) : undefined}
+           >
+             {isTransposed ? (
+               <>
+                 <thead className={`bg-base z-10 shadow-sm ${stickyColumnHeaders ? "sticky top-0" : ""}`}>
+                   <tr>
+                     <th
+                       onClick={handleSelectAll}
+                        className="px-2 py-2 text-xs font-semibold text-muted border-b border-r border-default bg-base sticky left-0 z-20 text-center select-none cursor-pointer hover:bg-elevated"
+                        style={{ width: transposedLabelColumnWidth }}
+                     >
+                       <span className="mr-1">#</span>
+                       <button
+                         type="button"
+                         onClick={(event) => {
+                           event.stopPropagation();
+                           setIsTransposed(false);
+                         }}
+                         className="p-1 rounded hover:bg-surface-secondary"
+                         aria-label={t("dataGrid.transposeView", { defaultValue: "Transpose view" })}
+                         title={t("dataGrid.transposeView", { defaultValue: "Transpose view" })}
+                       >
+                         <ArrowLeftRight size={14} />
+                       </button>
+                     </th>
+                      {transposedPaddingLeft > 0 && (
+                        <th
+                          style={{ width: transposedPaddingLeft, padding: 0, border: "none" }}
+                          onMouseEnter={() => setHoveredRowIndex(null)}
+                        />
                       )}
-                    </th>
-                  ))}
-                </tr>
-              ))}
-            </thead>
-            <tbody>
-              {virtualPaddingTop > 0 && (
-                <tr>
-                  <td
-                    colSpan={totalColumnCount}
-                    style={{ height: virtualPaddingTop, padding: 0, border: "none" }}
-                  />
-                </tr>
-              )}
-              {virtualItems.map((virtualRow) => {
+                        {renderedTransposedColumns.map((virtualColumn) => {
+                         const { mergedRow, rowIndex, isInsertion, isSelected } =
+                           transposedRows[virtualColumn.index];
+                         const columnWidth =
+                           virtualColumn.size ??
+                           transposedColumnWidths[virtualColumn.index] ??
+                           160;
+                         return (
+                        <th
+                          key={mergedRow.type === "insertion" ? mergedRow.tempId : rowIndex}
+                          style={{ width: columnWidth }}
+                         onClick={(event) => handleRowClick(rowIndex, event)}
+                         onDoubleClick={() => !readonlyProp && openInSidebar(rowIndex)}
+                          onMouseEnter={() => handleTransposedHover(rowIndex)}
+                           className={`relative px-4 py-2 text-xs font-semibold text-secondary tracking-wider border-b border-r border-default last:border-r-0 whitespace-nowrap cursor-pointer ${isSelected ? "bg-blue-900/40 text-blue-200" : hoveredRowIndex === rowIndex ? "bg-surface-secondary" : "hover:bg-elevated"}`}
+                         >
+                           {isInsertion ? t("dataGrid.newRow", { defaultValue: "NEW" }) : rowIndex + 1}
+                          <div
+                            role="separator"
+                            aria-orientation="vertical"
+                            data-transposed-column-resize={virtualColumn.index}
+                            onMouseDown={(event) =>
+                              startTransposedColumnResize(
+                                event,
+                                virtualColumn.index,
+                                columnWidth,
+                              )
+                            }
+                            className="absolute right-0 top-0 h-full w-1 cursor-col-resize hover:bg-blue-400"
+                          />
+                        </th>
+                        );
+                      })}
+                      {transposedPaddingRight > 0 && (
+                        <th
+                          style={{ width: transposedPaddingRight, padding: 0, border: "none" }}
+                          onMouseEnter={() => setHoveredRowIndex(null)}
+                        />
+                      )}
+                   </tr>
+                 </thead>
+                 <tbody>
+                     {columns.map((colName, colIndex) => {
+                       const rowHeight = transposedRowHeights[colIndex] ?? 35;
+                       return (
+                       <tr key={colName} style={{ height: rowHeight }}>
+                        <th
+                          className="relative px-4 py-1.5 text-xs font-semibold text-secondary border-b border-r border-default bg-base sticky left-0 z-10 whitespace-nowrap"
+                          style={{ width: transposedLabelColumnWidth }}
+                         onContextMenu={(e) => {
+                           e.preventDefault();
+                           setHeaderContextMenu({ x: e.clientX, y: e.clientY, colName });
+                         }}
+                        >
+                          {colName}
+                          <div
+                            role="separator"
+                            aria-orientation="horizontal"
+                            data-transposed-row-resize={colIndex}
+                            onMouseDown={(event) =>
+                              startTransposedRowResize(event, colIndex, rowHeight)
+                            }
+                            className="absolute bottom-0 left-0 h-1 w-full cursor-row-resize hover:bg-blue-400"
+                          />
+                        </th>
+                        {transposedPaddingLeft > 0 && (
+                          <td
+                            style={{ width: transposedPaddingLeft, padding: 0, border: "none" }}
+                            onMouseEnter={() => setHoveredRowIndex(null)}
+                          />
+                        )}
+                         {renderedTransposedColumns.map((virtualColumn) => {
+                          const {
+                            mergedRow,
+                            rowIndex,
+                            isInsertion,
+                            pkVal,
+                            isPendingDelete,
+                            isSelected,
+                          } = transposedRows[virtualColumn.index];
+                          const columnWidth =
+                            virtualColumn.size ??
+                            transposedColumnWidths[virtualColumn.index] ??
+                            160;
+                         const resolved = isInsertion
+                           ? resolveInsertionCellDisplay(mergedRow.rowData[colIndex], { colName, autoIncrementColumns, defaultValueColumns, nullableColumns })
+                           : resolveExistingCellDisplay(mergedRow.rowData[colIndex], pkVal, pkColumns, pendingChanges, { colName, autoIncrementColumns, defaultValueColumns, nullableColumns });
+                          const isEditing = editingCell?.rowIndex === rowIndex && editingCell.colIndex === colIndex;
+                          const isFocused = focusedCell?.rowIndex === rowIndex && focusedCell.colIndex === colIndex;
+                          const colType = columnTypeMap?.get(colName);
+                          const isJsonCell = isJsonCellTarget(
+                           colType,
+                           mergedRow.rowData[colIndex],
+                         );
+                         const fkForPreview = getForeignKeyForPreview(
+                           colName,
+                           mergedRow.rowData[colIndex],
+                           fksByColumn,
+                           { isPendingDelete, isInsertion },
+                         );
+                         const stateClass = getCellStateClass({
+                           isPendingDelete,
+                            isSelected,
+                           isInsertion,
+                           isAutoIncrementPlaceholder: resolved.isAutoIncrementPlaceholder,
+                           isDefaultValuePlaceholder: resolved.isDefaultValuePlaceholder,
+                           isModified: resolved.isModified,
+                           isJsonCell,
+                         });
+                         const formattedDisplay = formatCellValue(
+                           resolved.displayValue,
+                           t("dataGrid.null"),
+                           colType,
+                           columnLengthMap?.get(colName),
+                         );
+                         const valueColorClass =
+                           resultColorClassMap &&
+                           mergedRow.rowData[colIndex] !== null &&
+                           mergedRow.rowData[colIndex] !== undefined &&
+                           !isPendingDelete &&
+                           !isInsertion &&
+                           !resolved.isModified &&
+                           !resolved.isAutoIncrementPlaceholder &&
+                           !resolved.isDefaultValuePlaceholder
+                             ? resultColorClassMap.get(colName) ??
+                               `rcell-${getResultValueType(mergedRow.rowData[colIndex], colType)}`
+                             : undefined;
+                         const jsonPreview = truncateCellPreview(formattedDisplay).text;
+                         return (
+                           <td
+                              key={mergedRow.type === "insertion" ? mergedRow.tempId : rowIndex}
+                              style={{ width: columnWidth }}
+                             onClick={(event) => {
+                               setFocusedCell({ rowIndex, colIndex });
+                               handleRowClick(rowIndex, event);
+                               if (fkForPreview && onForeignKeyShowPanel) {
+                                 onForeignKeyShowPanel(
+                                   fkForPreview,
+                                   mergedRow.rowData[colIndex],
+                                 );
+                               } else {
+                                 onForeignKeyHidePanel?.();
+                               }
+                             }}
+                              onMouseEnter={() => handleTransposedHover(rowIndex)}
+                             onDoubleClick={() => !isPendingDelete && handleCellDoubleClick(rowIndex, colIndex, resolved.isAutoIncrementPlaceholder || resolved.isDefaultValuePlaceholder ? "" : resolved.displayValue)}
+                             onContextMenu={(e) => handleContextMenu(e, mergedRow.rowData, rowIndex, colIndex, colName)}
+                             className={`px-4 py-1.5 text-sm border-b border-r border-default last:border-r-0 font-mono min-w-[120px] max-w-[300px] ${isEditing ? "relative" : "whitespace-nowrap truncate"} ${fkForPreview ? "cursor-pointer" : "cursor-text"} ${isSelected ? "bg-blue-900/20" : hoveredRowIndex === rowIndex ? "bg-surface-secondary/50" : ""} ${stateClass} ${isFocused ? "ring-2 ring-inset ring-blue-400" : ""}`}
+                             title={!isEditing ? formattedDisplay : ""}
+                           >
+                             {isEditing ? (
+                               <textarea
+                                 ref={editInputRef}
+                                 value={String(editingCell.value ?? "")}
+                                 onChange={(e) => setEditingCell((previous) => previous ? { ...previous, value: e.target.value } : null)}
+                                 onBlur={handleEditCommit}
+                                 onKeyDown={handleKeyDown}
+                                 className="absolute left-0 top-0 max-w-[400px] max-h-[120px] bg-base text-primary border border-blue-500 rounded shadow-lg p-2 font-mono text-sm resize-none z-50 outline-none"
+                               />
+                              ) : isJsonCell ? (
+                                <span className="truncate">
+                                  {tokenizeJsonDisplay(jsonPreview).map((token, index) => (
+                                    <span
+                                      key={index}
+                                      data-token={token.type}
+                                      className={
+                                        token.type === "key"
+                                          ? "text-blue-300"
+                                          : token.type === "string"
+                                            ? "text-emerald-300"
+                                            : token.type === "number"
+                                              ? "text-amber-300"
+                                              : token.type === "boolean"
+                                                ? "text-purple-300"
+                                                : token.type === "null"
+                                                  ? "text-muted italic"
+                                                  : "text-secondary"
+                                      }
+                                    >
+                                      {token.text}
+                                    </span>
+                                  ))}
+                                </span>
+                              ) : (
+                                renderDefaultCellContent(
+                                  resolved.displayValue,
+                                  formattedDisplay,
+                                  valueColorClass,
+                                )
+                              )}
+                           </td>
+                         );
+                        })}
+                        {transposedPaddingRight > 0 && (
+                          <td
+                            style={{ width: transposedPaddingRight, padding: 0, border: "none" }}
+                            onMouseEnter={() => setHoveredRowIndex(null)}
+                          />
+                        )}
+                      </tr>
+                       );
+                     })}
+                 </tbody>
+               </>
+             ) : (
+               <>
+                 <thead
+                   className={`bg-base z-10 shadow-sm ${stickyColumnHeaders ? "sticky top-0" : ""}`}
+                 >
+                   {table.getHeaderGroups().map((headerGroup) => (
+                     <tr key={headerGroup.id}>
+                        <th
+                          onClick={handleSelectAll}
+                          className="px-2 py-2 text-xs font-semibold text-muted border-b border-r border-default bg-base sticky left-0 z-20 text-center select-none w-[50px] min-w-[50px] cursor-pointer hover:bg-elevated"
+                        >
+                          <span className="mr-1">#</span>
+                          <button
+                           type="button"
+                           onClick={(event) => {
+                             event.stopPropagation();
+                             setIsTransposed(true);
+                           }}
+                           className="p-1 rounded hover:bg-surface-secondary"
+                           aria-label={t("dataGrid.transposeView", { defaultValue: "Transpose view" })}
+                           title={t("dataGrid.transposeView", { defaultValue: "Transpose view" })}
+                          >
+                            <ArrowLeftRight size={14} />
+                          </button>
+                        </th>
+                       {headerGroup.headers.map((header) => (
+                         <th
+                           key={header.id}
+                           className="px-4 py-2 text-xs font-semibold text-secondary tracking-wider border-b border-r border-default last:border-r-0 whitespace-nowrap"
+                           onContextMenu={(e) => {
+                             e.preventDefault();
+                             setHeaderContextMenu({
+                               x: e.clientX,
+                               y: e.clientY,
+                               colName: header.id,
+                             });
+                           }}
+                         >
+                           {flexRender(
+                             header.column.columnDef.header,
+                             header.getContext(),
+                           )}
+                         </th>
+                       ))}
+                     </tr>
+                   ))}
+                 </thead>
+                 <tbody>
+                   {virtualPaddingTop > 0 && (
+                     <tr>
+                       <td
+                         colSpan={totalColumnCount}
+                         style={{ height: virtualPaddingTop, padding: 0, border: "none" }}
+                       />
+                     </tr>
+                   )}
+                   {virtualItems.map((virtualRow) => {
                 const rowIndex = virtualRow.index;
                 const row = tableRows[rowIndex];
                 const rowOriginal = row.original as unknown[];
@@ -1661,17 +2072,19 @@ export const DataGrid = React.memo(
                     expandedKind={isRowExpanded ? expandedCell!.kind : null}
                   />
                 );
-              })}
-              {virtualPaddingBottom > 0 && (
-                <tr>
-                  <td
-                    colSpan={totalColumnCount}
-                    style={{ height: virtualPaddingBottom, padding: 0, border: "none" }}
-                  />
-                </tr>
-              )}
-            </tbody>
-          </table>
+                   })}
+                   {virtualPaddingBottom > 0 && (
+                     <tr>
+                       <td
+                         colSpan={totalColumnCount}
+                         style={{ height: virtualPaddingBottom, padding: 0, border: "none" }}
+                       />
+                     </tr>
+                   )}
+                 </tbody>
+               </>
+             )}
+           </table>
 
           {contextMenu &&
             (() => {
